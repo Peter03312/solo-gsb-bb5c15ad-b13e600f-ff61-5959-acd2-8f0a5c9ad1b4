@@ -3,7 +3,9 @@
 供实验室**内网/离线环境**使用的基因组坐标区间迁移工具。用户在浏览器中
 上传 BED 文件与对应的 UCSC `chain` 文件，指定 BED 区间属于链的
 **target 侧**还是**query 侧**，先在页面上逐条预览转换状态，确认后再
-下载 TSV 结果。
+下载 TSV 结果。歧义行可在页面上按源文件**物理行号**进行人工裁决
+（选定一个候选或撤销选择），再单独下载裁决版 TSV；裁决只作用于本次
+结果，原始转换与原始 TSV 不会被改动。
 
 - 后端：Python 3.11+ / FastAPI / Uvicorn
 - 前端：原生 HTML + CSS + JavaScript（无任何 CDN / 外网依赖）
@@ -23,11 +25,11 @@
     │   ├── bed.py            # BED 解析（零基左闭右开，错误带行号）
     │   ├── chain.py          # UCSC chain 解析（严格校验，错误带行号）
     │   ├── engine.py         # 区间转换引擎（缺口拆分 / 歧义 / 负链）
-    │   ├── report.py         # TSV 导出与预览 JSON
-    │   └── main.py           # FastAPI 入口
-    ├── static/               # 前端（纯本地资源）
+    │   ├── report.py         # TSV 导出、预览 JSON、裁决版 TSV
+    │   └── main.py           # FastAPI 入口（转换 / 下载 / 人工裁决）
+    ├── static/               # 前端（纯本地资源，含歧义行裁决操作）
     ├── examples/             # 可直接试用的 BED / chain 示例
-    ├── tests/                # pytest 测试（26 个用例）
+    ├── tests/                # pytest 测试（43 个用例）
     ├── scripts/init.sh       # 本地开发依赖初始化
     ├── Dockerfile            # 方式 B 构建入口：以本目录为上下文
     ├── docker-compose.yml    # 两种启动方式共用
@@ -165,7 +167,8 @@ bash scripts/init.sh
    - **target 侧**：target → query；
    - **query 侧**：query → target。
 4. 点击「校验并转换」。页面显示每条源区间的状态；确认无误后点击
-   「下载完整结果 TSV」。
+   「下载原始结果 TSV」，或先对歧义行做人工裁决（见下节）再下载
+   「下载裁决版 TSV」。
 
 ### 状态定义
 
@@ -197,12 +200,64 @@ fragment_index, src_start, src_end, dest_start, dest_end, reason
 - 跨缺口区间每个片段占一行；歧义区间的每个候选、每个片段各占一行；
 - `unmapped` 行保留源行号与原因，候选/片段列写 `.`。
 
+裁决版 TSV 使用**相同的表头与 15 列**：已选歧义行仅保留被选候选的
+片段行（`candidate_index` 为被选候选的原序号），未选歧义行仍保留全部
+候选；两类行的 `reason` 分别追加 `【已裁决：选定候选 N】` /
+`【未裁决】`，`status` 列仍写 `ambiguous`。
+
 ### 失败即阻止导出
 
 - BED 坏行（列数不足、坐标非整数、`start >= end` 等）或 chain 格式错误
   （头列数/字段非法、块越界、缺少终止行、gap 越界等）都会在页面上
   **带行号列出全部问题**，接口返回 400，且**不会生成或保留任何可下载
   文件**；修正后需重新提交。
+
+---
+
+## 三·补、歧义区间的人工裁决
+
+歧义（`ambiguous`）行系统**绝不自动挑选**，需要人工裁决后才能用于
+下游分析。裁决按 BED **物理行号**逐行进行，只作用于**这一次转换结果**，
+不会、也不能改动原始转换。
+
+### 页面操作
+
+1. 转换预览中，每个歧义行最右侧有「人工裁决」列，列出该源行的全部
+   候选（chain id 及每个候选的覆盖片段）；
+2. 点选某个候选的单选框即提交裁决；点击「撤销选择（恢复未裁决）」
+   可撤销该行选择；
+3. 已裁决行在预览中只高亮被选候选、其余候选置灰；行状态徽标仍显示
+   **歧义**（裁决不会把部分/歧义映射改称为完全映射）；
+4. 裁决提交带**结果版本号**：成功修改后版本递增。若另一处（浏览器
+   标签页或 HTTP API）已抢先修改，本次提交收到版本冲突（HTTP 409），
+   页面自动同步最新选择并提示重试；
+5. 两个下载按钮分别对应：
+   - **下载原始结果 TSV**：转换当时的结果，任何裁决都不改变它；
+   - **下载裁决版 TSV**：应用当前裁决后的结果（规则见下）。
+
+### 裁决版 TSV 规则（表头与列序不变）
+
+- **已选定的歧义行**：只输出**被选候选的全部片段**（保留该候选原来的
+  `candidate_index`），`status` 仍为 `ambiguous`，`reason` 末尾追加
+  `【已裁决：选定候选 N】`；
+- **尚未裁决的歧义行**：仍输出**全部候选**的全部片段，`reason` 末尾
+  标明 `【未裁决】`；
+- `mapped` / `partial` / `unmapped` 行与原始 TSV **完全一致**；
+- 零基左闭右开坐标、片段顺序、列定义均与原始结果一致。
+
+> 结果只保存在服务进程内存中（默认 1 小时，见环境变量
+> `LIFTOVER_JOB_TTL_SECONDS`）。过期后裁决、查看与下载都返回 404，
+> 需重新提交转换。
+
+### HTTP API（脚本/流水线可直接调用）
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /api/adjudication/{token}` | 查看当前裁决版本与每行选择 |
+| `POST /api/adjudication/{token}` | 提交一行裁决（选择 / 撤销），带版本号 |
+| `GET /api/download/adjudicated/{token}` | 下载当前裁决版 TSV |
+
+具体请求/响应示例见下方「四、HTTP API 调用示例」。
 
 ---
 
@@ -242,6 +297,7 @@ curl -s -X POST http://localhost:8080/api/liftover \
 {
   "download_token": "……",
   "download_name": "liftover_target_to_query_20261005-120000.tsv",
+  "adjudication_version": 1,
   "preview": {
     "total": 6,
     "counts": {"mapped": 1, "partial": 1, "ambiguous": 1, "unmapped": 3},
@@ -249,6 +305,9 @@ curl -s -X POST http://localhost:8080/api/liftover \
   }
 }
 ```
+
+`adjudication_version` 是该结果的人工裁决初始版本号（新结果为 1，
+每次成功修改后 +1，详见下节）；其余字段与旧版完全一致。
 
 输入校验失败（400）只返回带行号的错误列表，**不会**产生任何可下载
 文件：
@@ -272,6 +331,104 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}"
 - token 不存在或已过期（404）：
   `{"errors": ["结果不存在或已过期，请重新提交转换"]}`。
 
+### 查看当前裁决状态
+
+`GET /api/adjudication/{download_token}`，返回裁决版本号、每个歧义行
+的候选数与当前选择，以及与转换接口同构的完整 `preview`：
+
+```bash
+curl -s "http://localhost:8080/api/adjudication/${TOKEN}"
+```
+
+```json
+{
+  "version": 1,
+  "resolved_count": 0,
+  "ambiguous_count": 1,
+  "decisions": [],
+  "ambiguous_rows": [
+    {"source_line": 11, "num_candidates": 2,
+     "selected_candidate": null, "resolved": false}
+  ],
+  "preview": { "total": 6, "counts": {"..." : "..."}, "rows": ["……"] }
+}
+```
+
+`source_line` 是源 BED 的**物理行号**（含注释行，从 1 开始）。示例中
+歧义行位于文件第 11 行（前 7 行为注释）。
+
+### 提交裁决（选择候选 / 撤销选择）
+
+`POST /api/adjudication/{download_token}`，`application/json`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `source_line` | 整数 | BED 物理行号，必须是该结果中的歧义行 |
+| `candidate_index` | 整数或 `null` | 1 基候选序号；`null`（或省略）表示撤销该行选择 |
+| `version` | 整数 | 所基于的结果裁决版本号（乐观锁） |
+
+示例：给第 11 行选定候选 2（初始版本 1）：
+
+```bash
+curl -s -X POST "http://localhost:8080/api/adjudication/${TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"source_line": 11, "candidate_index": 2, "version": 1}'
+```
+
+成功（200）返回（节选）：
+
+```json
+{
+  "changed": true,
+  "version": 2,
+  "source_line": 11,
+  "selected_candidate": 2,
+  "resolved_count": 1,
+  "decisions": [{"source_line": 11, "selected_candidate": 2}],
+  "ambiguous_rows": ["……"],
+  "preview": {"……": "……"}
+}
+```
+
+- 内容与当前选择相同的重复提交返回 `changed: false`，**版本不变**；
+  撤销一个本就未裁决的行同理。
+- **相同版本的并发修改只有一个成功**：另一个得到 409，
+  `current_version` 给出最新版本号，调用方应先 GET 同步后重试：
+
+```json
+{"errors": ["裁决版本已过期：提交基于版本 1，当前版本为 2；请重新查看当前选择后再提交"],
+ "current_version": 2}
+```
+
+撤销第 11 行的选择（`candidate_index` 为 `null`）：
+
+```bash
+curl -s -X POST "http://localhost:8080/api/adjudication/${TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{"source_line": 11, "candidate_index": null, "version": 2}'
+```
+
+明确拒绝（均为 400，且版本不变）：行号不存在（`源文件第 N 行不存在…`）、
+该行不是歧义行（`…状态为 mapped，只有歧义…行才允许人工裁决…`）、
+候选序号越界（`候选序号越界：第 11 行共有 2 个候选…`）、
+`version`/`source_line`/`candidate_index` 字段类型非法等。
+结果过期或 token 不存在返回 404。
+
+### 下载裁决版 TSV
+
+```bash
+curl -OJ "http://localhost:8080/api/download/adjudicated/${TOKEN}"
+```
+
+- 成功（200）：裁决版 TSV（UTF-8 带 BOM），文件名形如
+  `liftover_target_to_query_<时间戳>_adjudicated_v2.tsv`（`v2` 为当前
+  裁决版本）；
+- 已选歧义行只输出被选候选的全部片段，`status` 仍为 `ambiguous`，
+  `reason` 带 `【已裁决：选定候选 N】`；未选歧义行保留全部候选并带
+  `【未裁决】`；其他行与原始 TSV 一致；
+- 原始结果始终通过 `GET /api/download/{token}` 下载，**裁决前后字节
+  不变**；token 过期返回 404。
+
 ---
 
 ## 五、快速试用
@@ -284,7 +441,9 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}"
 ```
 
 该示例覆盖全部四种状态（完全映射 / 跨缺口拆分的部分映射 / 歧义 /
-无映射）。`examples/example_query.bed` 演示 query → target，
+无映射）。歧义行（源文件第 11 行 `chr1 320 360`，候选为
+chain 1→chrA 与 chain 2→chrB 负链）可直接在「人工裁决」列选定候选、
+撤销并下载裁决版 TSV。`examples/example_query.bed` 演示 query → target，
 包含负链 query 的反向转换；`examples/example_bad.bed` 演示错误定位
 与导出拦截。
 

@@ -55,8 +55,15 @@
   <section id="result-box" class="card hidden">
     <div class="result-head">
       <h2>转换预览</h2>
-      <button id="download-btn" type="button">下载完整结果 TSV</button>
+      <div class="dl-buttons">
+        <button id="download-adj-btn" type="button" class="btn-adj">下载裁决版 TSV</button>
+        <button id="download-btn" type="button">下载原始结果 TSV</button>
+      </div>
     </div>
+    <p class="adj-note" id="adj-note">
+      歧义行可在“人工裁决”列选定一个候选（或撤销），裁决仅作用于本次结果，
+      原始转换与原始 TSV 不会改变。当前裁决版本：<b id="adj-version">1</b>。
+    </p>
 
     <div class="stats" id="stats"></div>
 
@@ -80,6 +87,7 @@
             <th>状态</th>
             <th>候选 / 片段（目标染色体 · 方向 · 目标区间）</th>
             <th>说明</th>
+            <th>人工裁决</th>
           </tr>
         </thead>
         <tbody id="result-tbody"></tbody>
