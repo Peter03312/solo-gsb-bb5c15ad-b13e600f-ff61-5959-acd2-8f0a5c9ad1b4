@@ -1,16 +1,23 @@
-"""FastAPI 入口：上传、预览、下载。
+"""FastAPI 入口：上传、预览、下载、歧义人工裁决。
 
 结果只在校验完全通过后保存在进程内存中（BytesIO 等价物），
 任何解析错误都直接 400 返回，不创建、更不提供任何可下载文件。
+
+歧义裁决只作用于某一次转换结果（token 标识），绝不回写原始转换：
+
+- 原始结果 ``GET /api/download/{token}`` 的字节内容在裁决前后完全一致；
+- 裁决状态（选了哪个候选）带版本号做乐观并发控制，相同版本的并发
+  修改只有一次能成功；
+- 裁决版 TSV 由 ``GET /api/download/{token}/adjudicated`` 单独导出。
 """
 
 from __future__ import annotations
 
-import io
+import asyncio
 import os
 import secrets
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -18,8 +25,9 @@ from fastapi.staticfiles import StaticFiles
 
 from .bed import parse_bed
 from .chain import parse_chain
+from .engine import RowResult
 from .engine import LiftOverEngine
-from .report import build_tsv, rows_to_preview
+from .report import build_adjudicated_tsv, build_tsv, rows_to_preview
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "..", "static")
@@ -28,14 +36,19 @@ MAX_UPLOAD_BYTES = int(os.getenv("LIFTOVER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.getenv("LIFTOVER_JOB_TTL_SECONDS", "3600"))
 MAX_JOBS = int(os.getenv("LIFTOVER_MAX_JOBS", "100"))
 
-app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.0.0")
+app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.1.0")
 
 
 @dataclass
 class _Job:
-    tsv_bytes: bytes
+    rows: list[RowResult]
+    tsv_bytes: bytes               # 原始结果（永不改变）
     filename: str
     created_at: float
+    # 裁决状态：{源物理行号: 1 基候选序号}；撤销即删除键
+    decisions: dict[int, int] = field(default_factory=dict)
+    version: int = 0               # 每次成功修改递增
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 _jobs: dict[str, _Job] = {}
@@ -118,22 +131,188 @@ async def liftover(
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     filename = f"liftover_{side}_to_{'query' if side == 'target' else 'target'}_{stamp}.tsv"
     _prune_jobs()
-    _jobs[token] = _Job(tsv_bytes=payload, filename=filename, created_at=time.time())
+    _jobs[token] = _Job(
+        rows=rows, tsv_bytes=payload, filename=filename, created_at=time.time(),
+    )
 
     return {"download_token": token, "download_name": filename, "preview": preview}
 
 
-@app.get("/api/download/{token}")
-async def download(token: str) -> Response:
+def _get_job_or_404(token: str) -> _Job:
     _prune_jobs()
     job = _jobs.get(token)
     if job is None:
-        raise HTTPException(status_code=404,
-                            detail={"errors": ["结果不存在或已过期，请重新提交转换"]})
+        raise HTTPException(
+            status_code=404,
+            detail={"errors": ["结果不存在或已过期，请重新提交转换"]},
+        )
+    return job
+
+
+def _ambiguous_line_map(job: _Job) -> dict[int, RowResult]:
+    return {r.line_no: r for r in job.rows if r.status == "ambiguous"}
+
+
+@app.get("/api/download/{token}")
+async def download(token: str) -> Response:
+    job = _get_job_or_404(token)
+    # 原始结果：裁决前后字节完全一致
     return Response(
         content=job.tsv_bytes,
         media_type="text/tab-separated-values; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{job.filename}"'},
+    )
+
+
+@app.get("/api/result/{token}/decisions")
+async def list_decisions(token: str) -> dict:
+    """查看某次结果当前的歧义裁决选择与结果版本。"""
+    job = _get_job_or_404(token)
+    ambiguous = _ambiguous_line_map(job)
+    return {
+        "download_token": token,
+        "version": job.version,
+        "decisions": [
+            {
+                "source_line": line_no,
+                "candidate_index": job.decisions.get(line_no),
+                "candidate_count": len(ambiguous[line_no].candidates),
+            }
+            for line_no in sorted(ambiguous)
+        ],
+    }
+
+
+async def _read_json_body(request: Request) -> dict:
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400, detail={"errors": ["请求体必须是 JSON 对象"]}
+        )
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400, detail={"errors": ["请求体必须是 JSON 对象"]}
+        )
+    return body
+
+
+def _require_int(body: dict, key: str) -> int:
+    if key not in body:
+        raise HTTPException(status_code=400, detail={"errors": [f"缺少字段 {key}"]})
+    val = body[key]
+    # bool 是 int 的子类，显式拒绝，避免 True 被当成 1
+    if not isinstance(val, int) or isinstance(val, bool):
+        raise HTTPException(status_code=400, detail={"errors": [f"字段 {key} 必须是整数"]})
+    return val
+
+
+@app.post("/api/result/{token}/decisions")
+async def submit_decisions(token: str, request: Request) -> dict:
+    """提交歧义行裁决（选定候选 / 撤销选择）。
+
+    请求体：``{"version": <当前结果版本>, "source_line": <BED 物理行号>,
+    "candidate_index": <1 基候选序号，或 null 表示撤销>}``。
+
+    - 结果不存在/过期 → 404；
+    - source_line 不存在、该行不是歧义行、候选序号越界 → 400；
+    - version 与当前版本不一致（含相同版本的并发修改竞跑失败者）→ 409；
+    - 仅当选择确实发生变化时版本才 +1；与当前一致的重复提交不递增。
+    """
+    body = await _read_json_body(request)
+    version = _require_int(body, "version")
+    source_line = _require_int(body, "source_line")
+    if "candidate_index" not in body:
+        raise HTTPException(status_code=400,
+                            detail={"errors": ["缺少字段 candidate_index"]})
+    candidate_index = body["candidate_index"]
+    if candidate_index is not None and (
+        not isinstance(candidate_index, int) or isinstance(candidate_index, bool)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": ["candidate_index 必须是正整数或 null"]},
+        )
+
+    job = _get_job_or_404(token)
+
+    async with job.lock:
+        if version != job.version:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "errors": [
+                        f"结果版本已过期：提交基于版本 {version}，当前为 {job.version}，"
+                        "请先重新查看当前选择后再提交"
+                    ],
+                    "current_version": job.version,
+                },
+            )
+
+        row = next((r for r in job.rows if r.line_no == source_line), None)
+        if row is None:
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [f"源文件第 {source_line} 行不存在于本次结果中"]},
+            )
+        if row.status != "ambiguous":
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [
+                    f"源文件第 {source_line} 行状态为 {row.status}，"
+                    "只有歧义（ambiguous）行允许人工裁决"
+                ]},
+            )
+
+        n_cand = len(row.candidates)
+        if candidate_index is not None and not (1 <= candidate_index <= n_cand):
+            raise HTTPException(
+                status_code=400,
+                detail={"errors": [
+                    f"候选序号越界：第 {source_line} 行共有 {n_cand} 个候选，"
+                    f"收到 candidate_index={candidate_index}，允许范围 1..{n_cand}"
+                ]},
+            )
+
+        previous = job.decisions.get(source_line)
+        modified = previous != candidate_index
+        if modified:
+            if candidate_index is None:
+                job.decisions.pop(source_line, None)
+            else:
+                job.decisions[source_line] = candidate_index
+            job.version += 1
+
+        return {
+            "download_token": token,
+            "version": job.version,
+            "modified": modified,
+            "source_line": source_line,
+            "candidate_index": candidate_index,
+        }
+
+
+def _adjudicated_name(filename: str, version: int) -> str:
+    if filename.endswith(".tsv"):
+        return f"{filename[:-4]}.adjudicated.v{version}.tsv"
+    return f"{filename}.adjudicated.v{version}.tsv"
+
+
+@app.get("/api/download/{token}/adjudicated")
+async def download_adjudicated(token: str) -> Response:
+    """下载裁决版 TSV。
+
+    已选歧义行仅输出被选候选的全部片段；未选歧义行输出全部候选并标明
+    “未裁决”；其他状态行照原结果输出。原始 status 列保持不变。
+    """
+    job = _get_job_or_404(token)
+    text = build_adjudicated_tsv(job.rows, job.decisions)
+    payload = b"\xef\xbb\xbf" + text.encode("utf-8")
+    filename = _adjudicated_name(job.filename, job.version)
+    return Response(
+        content=payload,
+        media_type="text/tab-separated-values; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

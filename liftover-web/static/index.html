@@ -55,10 +55,15 @@
   <section id="result-box" class="card hidden">
     <div class="result-head">
       <h2>转换预览</h2>
-      <button id="download-btn" type="button">下载完整结果 TSV</button>
+      <div class="btn-row">
+        <button id="download-btn" type="button">下载原始结果 TSV</button>
+        <button id="download-adj-btn" class="secondary" type="button">下载裁决版 TSV</button>
+      </div>
     </div>
 
     <div class="stats" id="stats"></div>
+
+    <p class="decision-note" id="decision-note"></p>
 
     <div class="filters" id="filters">
       <span>筛选：</span>
@@ -70,6 +75,7 @@
     </div>
 
     <p class="preview-note" id="preview-note"></p>
+    <p class="action-msg" id="action-msg" role="status"></p>
 
     <div class="table-wrap">
       <table id="result-table">
